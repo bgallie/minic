@@ -33,9 +33,6 @@ import (
 )
 
 const (
-	FlagSetByMinicAnnotation     = "minic_annotation_flag_set_by_minic"
-	CommandDisplayNameAnnotation = "minic_annotation_command_display_name"
-
 	helpFlagName            = "help"
 	helpCommandName         = "help"
 	defaultCommandSorting   = true
@@ -75,12 +72,6 @@ var MousetrapDisplayDuration = 5 * time.Second
 // FParseErrWhitelist configures Flag parse errors to be ignored
 type FParseErrWhitelist flag.ParseErrorsAllowlist
 
-// Group Structure to manage groups for commands
-type Group struct {
-	ID    string
-	Title string
-}
-
 // Command is just that, a command for your application.
 // E.g.  'go run ...' - 'run' is the command. Cobra requires
 // you to define the usage and description as part of your command
@@ -97,18 +88,8 @@ type Command struct {
 	// Example: add [-F file | -D dir]... [-f format] profile
 	Use string
 
-	// Aliases is an array of aliases that can be used instead of the first word in Use.
-	Aliases []string
-
-	// SuggestFor is an array of command names for which this command will be suggested -
-	// similar to aliases but only suggests.
-	SuggestFor []string
-
 	// Short is the short description shown in the 'help' output.
 	Short string
-
-	// The group id under which this subcommand is grouped in the 'help' output of its parent.
-	GroupID string
 
 	// Long is the long message shown in the 'help <this-command>' output.
 	Long string
@@ -118,22 +99,6 @@ type Command struct {
 
 	// Expected arguments
 	Args PositionalArgs
-
-	// ArgAliases is List of aliases for ValidArgs.
-	// These are not suggested to the user in the shell completion,
-	// but accepted if entered manually.
-	ArgAliases []string
-
-	// BashCompletionFunction is custom bash functions used by the legacy bash autocompletion generator.
-	// For portability with other shells, it is recommended to instead use ValidArgsFunction
-	BashCompletionFunction string
-
-	// Deprecated defines, if this command is deprecated and should print this string when used.
-	Deprecated string
-
-	// Annotations are key/value pairs that can be used by applications to identify or
-	// group commands or set special options.
-	Annotations map[string]string
 
 	// Version defines the version for this command. If this value is non-empty and the command does not
 	// define a "version" flag, a "version" boolean flag will be added to the command and, if specified,
@@ -172,9 +137,6 @@ type Command struct {
 	// PersistentPostRunE: PersistentPostRun but returns an error.
 	PersistentPostRunE func(cmd *Command, args []string) error
 
-	// groups for subcommands
-	commandgroups []*Group
-
 	// args is actual args parsed from flags.
 	args []string
 	// flagErrorBuf contains all error messages from pflag.
@@ -197,26 +159,14 @@ type Command struct {
 
 	// usageFunc is usage func defined by user.
 	usageFunc func(*Command) error
-	// usageTemplate is usage template defined by user.
-	usageTemplate *tmplFunc
 	// flagErrorFunc is func defined by user and it's called when the parsing of
 	// flags returns an error.
 	flagErrorFunc func(*Command, error) error
-	// helpTemplate is help template defined by user.
-	helpTemplate *tmplFunc
 	// helpFunc is help func defined by user.
 	helpFunc func(*Command, []string)
 	// helpCommand is command with usage 'help'. If it's not defined by user,
 	// cobra uses default help command.
 	helpCommand *Command
-	// helpCommandGroupID is the group id for the helpCommand
-	helpCommandGroupID string
-
-	// completionCommandGroupID is the group id for the completion command
-	completionCommandGroupID string
-
-	// versionTemplate is the version template defined by user.
-	versionTemplate *tmplFunc
 
 	// errPrefix is the error message prefix defined by user.
 	errPrefix string
@@ -306,15 +256,6 @@ func (c *Command) SetArgs(a []string) {
 	c.args = a
 }
 
-// SetOutput sets the destination for usage and error messages.
-// If output is nil, os.Stderr is used.
-//
-// Deprecated: Use SetOut and/or SetErr instead
-func (c *Command) SetOutput(output io.Writer) {
-	c.outWriter = output
-	c.errWriter = output
-}
-
 // SetOut sets the destination for usage messages.
 // If newOut is nil, os.Stdout is used.
 func (c *Command) SetOut(newOut io.Writer) {
@@ -352,21 +293,6 @@ func (c *Command) SetHelpFunc(f func(*Command, []string)) {
 // SetHelpCommand sets help command.
 func (c *Command) SetHelpCommand(cmd *Command) {
 	c.helpCommand = cmd
-}
-
-// SetHelpCommandGroupID sets the group id of the help command.
-func (c *Command) SetHelpCommandGroupID(groupID string) {
-	if c.helpCommand != nil {
-		c.helpCommand.GroupID = groupID
-	}
-	// helpCommandGroupID is used if no helpCommand is defined by the user
-	c.helpCommandGroupID = groupID
-}
-
-// SetCompletionCommandGroupID sets the group id of the completion command.
-func (c *Command) SetCompletionCommandGroupID(groupID string) {
-	// completionCommandGroupID is used if no completion command is defined by the user
-	c.Root().completionCommandGroupID = groupID
 }
 
 // SetErrPrefix sets error message prefix to be used. Application can use it to set custom prefix.
@@ -447,26 +373,13 @@ func (c *Command) UsageFunc() (f func(*Command) error) {
 	}
 	return func(c *Command) error {
 		c.mergePersistentFlags()
-		fn := c.getUsageTemplateFunc()
+		fn := defaultUsageFunc
 		err := fn(c.OutOrStderr(), c)
 		if err != nil {
 			c.PrintErrln(err)
 		}
 		return err
 	}
-}
-
-// getUsageTemplateFunc returns the usage template function for the command
-// going up the command tree if necessary.
-func (c *Command) getUsageTemplateFunc() func(w io.Writer, data interface{}) error {
-	if c.usageTemplate != nil {
-		return c.usageTemplate.fn
-	}
-
-	if c.HasParent() {
-		return c.parent.getUsageTemplateFunc()
-	}
-	return defaultUsageFunc
 }
 
 // Usage puts out the usage for the command.
@@ -487,7 +400,7 @@ func (c *Command) HelpFunc() func(*Command, []string) {
 	}
 	return func(c *Command, a []string) {
 		c.mergePersistentFlags()
-		fn := c.getHelpTemplateFunc()
+		fn := defaultHelpFunc
 		// The help should be sent to stdout
 		// See https://github.com/spf13/cobra/issues/1002
 		err := fn(c.OutOrStdout(), c)
@@ -495,20 +408,6 @@ func (c *Command) HelpFunc() func(*Command, []string) {
 			c.PrintErrln(err)
 		}
 	}
-}
-
-// getHelpTemplateFunc returns the help template function for the command
-// going up the command tree if necessary.
-func (c *Command) getHelpTemplateFunc() func(w io.Writer, data interface{}) error {
-	if c.helpTemplate != nil {
-		return c.helpTemplate.fn
-	}
-
-	if c.HasParent() {
-		return c.parent.getHelpTemplateFunc()
-	}
-
-	return defaultHelpFunc
 }
 
 // Help puts out the help for the command.
@@ -582,32 +481,6 @@ func (c *Command) NamePadding() int {
 		return minNamePadding
 	}
 	return c.parent.commandsMaxNameLen
-}
-
-// HelpTemplate return help template for the command.
-// This function is kept for backwards-compatibility reasons.
-func (c *Command) HelpTemplate() string {
-	if c.helpTemplate != nil {
-		return c.helpTemplate.tmpl
-	}
-
-	if c.HasParent() {
-		return c.parent.HelpTemplate()
-	}
-	return defaultHelpTemplate
-}
-
-// getVersionTemplateFunc returns the version template function for the command
-// going up the command tree if necessary.
-func (c *Command) getVersionTemplateFunc() func(w io.Writer, data interface{}) error {
-	if c.versionTemplate != nil {
-		return c.versionTemplate.fn
-	}
-
-	if c.HasParent() {
-		return c.parent.getVersionTemplateFunc()
-	}
-	return defaultVersionFunc
 }
 
 // ErrPrefix return error message prefix for the command
@@ -832,13 +705,27 @@ func (c *Command) ArgsLenAtDash() int {
 	return c.Flags().ArgsLenAtDash()
 }
 
+type errRunner struct {
+	err error
+}
+
+func (erun *errRunner) Runner(fnE func(*Command, []string) error, fn func(*Command, []string), c *Command, args []string) {
+	if erun.err == nil {
+		if fnE != nil {
+			erun.err = fnE(c, args)
+		}
+	} else if fn != nil {
+		fn(c, args)
+	}
+}
+
+func (erun *errRunner) Error() error {
+	return erun.err
+}
+
 func (c *Command) execute(a []string) (err error) {
 	if c == nil {
 		return fmt.Errorf("called Execute() on a nil Command")
-	}
-
-	if len(c.Deprecated) > 0 {
-		c.Printf("Command %q is deprecated, %s\n", c.Name(), c.Deprecated)
 	}
 
 	// initialize help and version flag at the last point possible to allow for user
@@ -873,8 +760,7 @@ func (c *Command) execute(a []string) (err error) {
 			return err
 		}
 		if versionVal {
-			fn := c.getVersionTemplateFunc()
-			err := fn(c.OutOrStdout(), c)
+			err := defaultVersionFunc(c.OutOrStdout(), c)
 			if err != nil {
 				c.Println(err)
 			}
@@ -887,7 +773,6 @@ func (c *Command) execute(a []string) (err error) {
 	}
 
 	c.preRun()
-
 	defer c.postRun()
 
 	argWoFlags := c.Flags().Args()
@@ -911,60 +796,25 @@ func (c *Command) execute(a []string) (err error) {
 			parents = append(parents, p)
 		}
 	}
-	for _, p := range parents {
-		if p.PersistentPreRunE != nil {
-			if err := p.PersistentPreRunE(c, argWoFlags); err != nil {
-				return err
-			}
-			if !EnableTraverseRunHooks {
-				break
-			}
-		} else if p.PersistentPreRun != nil {
-			p.PersistentPreRun(c, argWoFlags)
-			if !EnableTraverseRunHooks {
-				break
-			}
-		}
-	}
-	if c.PreRunE != nil {
-		if err := c.PreRunE(c, argWoFlags); err != nil {
-			return err
-		}
-	} else if c.PreRun != nil {
-		c.PreRun(c, argWoFlags)
-	}
 
-	if c.RunE != nil {
-		if err := c.RunE(c, argWoFlags); err != nil {
-			return err
-		}
-	} else {
-		c.Run(c, argWoFlags)
-	}
-	if c.PostRunE != nil {
-		if err := c.PostRunE(c, argWoFlags); err != nil {
-			return err
-		}
-	} else if c.PostRun != nil {
-		c.PostRun(c, argWoFlags)
-	}
-	for p := c; p != nil; p = p.Parent() {
-		if p.PersistentPostRunE != nil {
-			if err := p.PersistentPostRunE(c, argWoFlags); err != nil {
-				return err
-			}
-			if !EnableTraverseRunHooks {
-				break
-			}
-		} else if p.PersistentPostRun != nil {
-			p.PersistentPostRun(c, argWoFlags)
-			if !EnableTraverseRunHooks {
-				break
-			}
+	eRun := &errRunner{}
+	p := parents[0]
+	eRun.Runner(p.PersistentPreRunE, p.PersistentPreRun, c, argWoFlags)
+	if EnableTraverseRunHooks {
+		for _, p := range parents[1:] {
+			eRun.Runner(p.PersistentPreRunE, p.PersistentPreRun, c, argWoFlags)
 		}
 	}
-
-	return nil
+	eRun.Runner(c.PreRunE, c.PreRun, c, argWoFlags)
+	eRun.Runner(c.RunE, c.Run, c, argWoFlags)
+	eRun.Runner(c.PostRunE, c.PostRun, c, argWoFlags)
+	eRun.Runner(c.PersistentPostRunE, c.PersistentPostRun, c, argWoFlags)
+	if EnableTraverseRunHooks {
+		for p := c.parent; p != nil; p = p.Parent() {
+			eRun.Runner(p.PersistentPostRunE, p.PersistentPostRun, c, argWoFlags)
+		}
+	}
+	return eRun.Error()
 }
 
 func (c *Command) preRun() {
@@ -1029,10 +879,6 @@ func (c *Command) ExecuteC() (cmd *Command, err error) {
 		args = os.Args[1:]
 	}
 
-	// Now that all commands have been created, let's make sure all groups
-	// are properly created also
-	c.checkCommandGroups()
-
 	var flags []string
 	if c.TraverseChildren {
 		cmd, flags, err = c.Traverse(args)
@@ -1088,22 +934,9 @@ func (c *Command) ExecuteC() (cmd *Command, err error) {
 
 func (c *Command) ValidateArgs(args []string) error {
 	if c.Args == nil {
-		return ArbitraryArgs(c, args)
+		return nil
 	}
 	return c.Args(c, args)
-}
-
-// checkCommandGroups checks if a command has been added to a group that does not exists.
-// If so, we panic because it indicates a coding error that should be corrected.
-func (c *Command) checkCommandGroups() {
-	for _, sub := range c.commands {
-		// if Group is not defined let the developer know right away
-		if sub.GroupID != "" && !c.ContainsGroup(sub.GroupID) {
-			panic(fmt.Sprintf("group id '%s' is not defined for subcommand '%s'", sub.GroupID, sub.CommandPath()))
-		}
-
-		sub.checkCommandGroups()
-	}
 }
 
 // InitDefaultHelpFlag adds default help flag to c.
@@ -1120,7 +953,6 @@ func (c *Command) InitDefaultHelpFlag() {
 			usage += name
 		}
 		c.Flags().BoolP(helpFlagName, "h", false, usage)
-		_ = c.Flags().SetAnnotation(helpFlagName, FlagSetByMinicAnnotation, []string{"true"})
 	}
 }
 
@@ -1146,7 +978,6 @@ func (c *Command) InitDefaultVersionFlag() {
 		} else {
 			c.Flags().Bool("version", false, usage)
 		}
-		_ = c.Flags().SetAnnotation("version", FlagSetByMinicAnnotation, []string{"true"})
 	}
 }
 
@@ -1180,7 +1011,6 @@ Simply type ` + c.DisplayName() + ` help [path to command] for full details.`,
 					CheckErr(cmd.Help())
 				}
 			},
-			GroupID: c.helpCommandGroupID,
 		}
 	}
 	c.RemoveCommand(c.helpCommand)
@@ -1239,36 +1069,6 @@ func (c *Command) AddCommand(cmds ...*Command) {
 		c.commands = append(c.commands, x)
 		c.commandsAreSorted = false
 	}
-}
-
-// Groups returns a slice of child command groups.
-func (c *Command) Groups() []*Group {
-	return c.commandgroups
-}
-
-// AllChildCommandsHaveGroup returns if all subcommands are assigned to a group
-func (c *Command) AllChildCommandsHaveGroup() bool {
-	for _, sub := range c.commands {
-		if (sub.IsAvailableCommand() || sub == c.helpCommand) && sub.GroupID == "" {
-			return false
-		}
-	}
-	return true
-}
-
-// ContainsGroup return if groupID exists in the list of command groups.
-func (c *Command) ContainsGroup(groupID string) bool {
-	for _, x := range c.commandgroups {
-		if x.ID == groupID {
-			return true
-		}
-	}
-	return false
-}
-
-// AddGroup adds one or more command groups to this parent command.
-func (c *Command) AddGroup(groups ...*Group) {
-	c.commandgroups = append(c.commandgroups, groups...)
 }
 
 // RemoveCommand removes one or more commands from a parent command.
@@ -1346,9 +1146,6 @@ func (c *Command) CommandPath() string {
 // DisplayName returns the name to display in help text. Returns command Name()
 // If CommandDisplayNameAnnoation is not set
 func (c *Command) DisplayName() string {
-	if displayName, ok := c.Annotations[CommandDisplayNameAnnotation]; ok {
-		return displayName
-	}
 	return c.Name()
 }
 
@@ -1370,47 +1167,6 @@ func (c *Command) UseLine() string {
 	return useline
 }
 
-// DebugFlags used to determine which flags have been assigned to which commands
-// and which persist.
-func (c *Command) DebugFlags() {
-	c.Println("DebugFlags called on", c.Name())
-	var debugflags func(*Command)
-
-	debugflags = func(x *Command) {
-		if x.HasFlags() || x.HasPersistentFlags() {
-			c.Println(x.Name())
-		}
-		if x.HasFlags() {
-			x.flags.VisitAll(func(f *flag.Flag) {
-				if x.HasPersistentFlags() && x.persistentFlag(f.Name) != nil {
-					c.Println("  -"+f.Shorthand+",", "--"+f.Name, "["+f.DefValue+"]", "", f.Value, "  [LP]")
-				} else {
-					c.Println("  -"+f.Shorthand+",", "--"+f.Name, "["+f.DefValue+"]", "", f.Value, "  [L]")
-				}
-			})
-		}
-		if x.HasPersistentFlags() {
-			x.pflags.VisitAll(func(f *flag.Flag) {
-				if x.HasFlags() {
-					if x.flags.Lookup(f.Name) == nil {
-						c.Println("  -"+f.Shorthand+",", "--"+f.Name, "["+f.DefValue+"]", "", f.Value, "  [P]")
-					}
-				} else {
-					c.Println("  -"+f.Shorthand+",", "--"+f.Name, "["+f.DefValue+"]", "", f.Value, "  [P]")
-				}
-			})
-		}
-		c.Println(x.flagErrorBuf)
-		if x.HasSubCommands() {
-			for _, y := range x.commands {
-				debugflags(y)
-			}
-		}
-	}
-
-	debugflags(c)
-}
-
 // Name returns the command's name: the first word in the use line.
 func (c *Command) Name() string {
 	name := c.Use
@@ -1419,16 +1175,6 @@ func (c *Command) Name() string {
 		name = name[:i]
 	}
 	return name
-}
-
-// HasAlias determines if a given string is an alias of the command.
-func (c *Command) HasAlias(s string) bool {
-	for _, a := range c.Aliases {
-		if commandNameMatches(a, s) {
-			return true
-		}
-	}
-	return false
 }
 
 // CalledAs returns the command name or alias that was used to invoke
@@ -1458,7 +1204,7 @@ func (c *Command) HasSubCommands() bool {
 // IsAvailableCommand determines if a command is available as a non-help command
 // (this includes all non deprecated/hidden commands).
 func (c *Command) IsAvailableCommand() bool {
-	if len(c.Deprecated) != 0 || c.Hidden {
+	if c.Hidden {
 		return false
 	}
 
@@ -1480,7 +1226,7 @@ func (c *Command) IsAvailableCommand() bool {
 // Concrete example: https://github.com/spf13/cobra/issues/393#issuecomment-282741924.
 func (c *Command) IsAdditionalHelpTopicCommand() bool {
 	// if a command is runnable, deprecated, or hidden it is not a 'help' command
-	if c.Runnable() || len(c.Deprecated) != 0 || c.Hidden {
+	if c.Runnable() || c.Hidden {
 		return false
 	}
 
@@ -1786,12 +1532,6 @@ func commandNameMatches(s string, t string) bool {
 	return s == t
 }
 
-// tmplFunc holds a template and a function that will execute said template.
-type tmplFunc struct {
-	tmpl string
-	fn   func(io.Writer, interface{}) error
-}
-
 // defaultUsageFunc is equivalent to executing defaultUsageTemplate. The two should be changed in sync.
 func defaultUsageFunc(w io.Writer, in interface{}) error {
 	c := in.(*Command)
@@ -1808,29 +1548,10 @@ func defaultUsageFunc(w io.Writer, in interface{}) error {
 	}
 	if c.HasAvailableSubCommands() {
 		cmds := c.Commands()
-		if len(c.Groups()) == 0 {
-			fmt.Fprintf(w, "\n\nAvailable Commands:")
-			for _, subcmd := range cmds {
-				if subcmd.IsAvailableCommand() || subcmd.Name() == helpCommandName {
-					fmt.Fprintf(w, "\n  %s %s", rpad(subcmd.Name(), subcmd.NamePadding()), subcmd.Short)
-				}
-			}
-		} else {
-			for _, group := range c.Groups() {
-				fmt.Fprintf(w, "\n\n%s", group.Title)
-				for _, subcmd := range cmds {
-					if subcmd.GroupID == group.ID && (subcmd.IsAvailableCommand() || subcmd.Name() == helpCommandName) {
-						fmt.Fprintf(w, "\n  %s %s", rpad(subcmd.Name(), subcmd.NamePadding()), subcmd.Short)
-					}
-				}
-			}
-			if !c.AllChildCommandsHaveGroup() {
-				fmt.Fprintf(w, "\n\nAdditional Commands:")
-				for _, subcmd := range cmds {
-					if subcmd.GroupID == "" && (subcmd.IsAvailableCommand() || subcmd.Name() == helpCommandName) {
-						fmt.Fprintf(w, "\n  %s %s", rpad(subcmd.Name(), subcmd.NamePadding()), subcmd.Short)
-					}
-				}
+		fmt.Fprintf(w, "\n\nAvailable Commands:")
+		for _, subcmd := range cmds {
+			if subcmd.IsAvailableCommand() || subcmd.Name() == helpCommandName {
+				fmt.Fprintf(w, "\n  %s %s", rpad(subcmd.Name(), subcmd.NamePadding()), subcmd.Short)
 			}
 		}
 	}
@@ -1856,10 +1577,6 @@ func defaultUsageFunc(w io.Writer, in interface{}) error {
 	fmt.Fprintln(w)
 	return nil
 }
-
-const defaultHelpTemplate = `{{with (or .Long .Short)}}{{. | trimTrailingWhitespaces}}
-
-{{end}}{{if or .Runnable .HasSubCommands}}{{.UsageString}}{{end}}`
 
 // defaultHelpFunc is equivalent to executing defaultHelpTemplate. The two should be changed in sync.
 func defaultHelpFunc(w io.Writer, in interface{}) error {
@@ -1903,79 +1620,6 @@ func legacyArgs(cmd *Command, args []string) error {
 		return fmt.Errorf("unknown command %q for %q", args[0], cmd.CommandPath())
 	}
 	return nil
-}
-
-// NoArgs returns an error if any args are included.
-func NoArgs(cmd *Command, args []string) error {
-	if len(args) > 0 {
-		return fmt.Errorf("unknown command %q for %q", args[0], cmd.CommandPath())
-	}
-	return nil
-}
-
-// ArbitraryArgs never returns an error.
-func ArbitraryArgs(cmd *Command, args []string) error {
-	return nil
-}
-
-// MinimumNArgs returns an error if there is not at least N args.
-func MinimumNArgs(n int) PositionalArgs {
-	return func(cmd *Command, args []string) error {
-		if len(args) < n {
-			return fmt.Errorf("requires at least %d arg(s), only received %d", n, len(args))
-		}
-		return nil
-	}
-}
-
-// MaximumNArgs returns an error if there are more than N args.
-func MaximumNArgs(n int) PositionalArgs {
-	return func(cmd *Command, args []string) error {
-		if len(args) > n {
-			return fmt.Errorf("accepts at most %d arg(s), received %d", n, len(args))
-		}
-		return nil
-	}
-}
-
-// ExactArgs returns an error if there are not exactly n args.
-func ExactArgs(n int) PositionalArgs {
-	return func(cmd *Command, args []string) error {
-		if len(args) != n {
-			return fmt.Errorf("accepts %d arg(s), received %d", n, len(args))
-		}
-		return nil
-	}
-}
-
-// RangeArgs returns an error if the number of args is not within the expected range.
-func RangeArgs(min int, max int) PositionalArgs {
-	return func(cmd *Command, args []string) error {
-		if len(args) < min || len(args) > max {
-			return fmt.Errorf("accepts between %d and %d arg(s), received %d", min, max, len(args))
-		}
-		return nil
-	}
-}
-
-// MatchAll allows combining several PositionalArgs to work in concert.
-func MatchAll(pargs ...PositionalArgs) PositionalArgs {
-	return func(cmd *Command, args []string) error {
-		for _, parg := range pargs {
-			if err := parg(cmd, args); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-}
-
-// ExactValidArgs returns an error if there are not exactly N positional args OR
-// there are any positional args that are not in the `ValidArgs` field of `Command`
-//
-// Deprecated: use MatchAll(ExactArgs(n), OnlyValidArgs) instead
-func ExactValidArgs(n int) PositionalArgs {
-	return MatchAll(ExactArgs(n))
 }
 
 // CheckErr prints the msg with the prefix 'Error:' and exits with error code 1. If the msg is nil, it does nothing.
