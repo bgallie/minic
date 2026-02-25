@@ -713,9 +713,9 @@ func (erun *errRunner) Runner(fnE func(*Command, []string) error, fn func(*Comma
 	if erun.err == nil {
 		if fnE != nil {
 			erun.err = fnE(c, args)
+		} else if fn != nil {
+			fn(c, args)
 		}
-	} else if fn != nil {
-		fn(c, args)
 	}
 }
 
@@ -874,8 +874,8 @@ func (c *Command) ExecuteC() (cmd *Command, err error) {
 
 	args := c.args
 
-	// Workaround FAIL with "go test -v" or "cobra.test -test.v", see #155
-	if c.args == nil && filepath.Base(os.Args[0]) != "cobra.test" {
+	// Workaround FAIL with "go test -v" or "minic.test -test.v", see #155
+	if c.args == nil && filepath.Base(os.Args[0]) != "minic.test" {
 		args = os.Args[1:]
 	}
 
@@ -897,10 +897,10 @@ func (c *Command) ExecuteC() (cmd *Command, err error) {
 		return c, err
 	}
 
-	cmd.commandCalledAs.called = true
-	if cmd.commandCalledAs.name == "" {
-		cmd.commandCalledAs.name = cmd.Name()
-	}
+	// cmd.commandCalledAs.called = true
+	// if cmd.commandCalledAs.name == "" {
+	// 	cmd.commandCalledAs.name = cmd.Name()
+	// }
 
 	// We have to pass global context to children command
 	// if context is present on the parent command.
