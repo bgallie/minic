@@ -22,23 +22,34 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
+	dbug "runtime/debug"
+	"slices"
 	"sort"
 	"strings"
 	"time"
 	"unicode"
 
 	flag "github.com/spf13/pflag"
+	"golang.org/x/term"
 )
 
 const (
 	helpFlagName            = "help"
 	helpCommandName         = "help"
+	versionFlagName         = "version"
+	versionCommandName      = "version"
 	defaultCommandSorting   = true
 	defaultCaseInsensitive  = false
 	defaultTraverseRunHooks = false
 )
+
+// The osCputtype variable is used to determine which set of configuration
+// values to use for the current OS and architecture.  It is set from the build
+// information stored in the binary.
+var OsCpuType string
 
 // EnableCommandSorting controls sorting of the slice of commands, which is turned on by default.
 // To disable sorting, set it to false.
@@ -106,6 +117,23 @@ type Command struct {
 	// command does not define one.
 	Version string
 
+	// The following fields are used to store build information.
+	// They are set from the build information embedded in the binary, and are
+	// used to populate the version information for this command.
+
+	// ScmCommit is the commit hash of the source code for this program.
+	ScmCommit string
+	// ScmState is the state of the source code used to build this command.
+	// Typically "clean" or "dirty".
+	ScmState string
+	// ScmSummary is a summary of the source code used to build this command.
+	// Typically a combination of version and commit hash.
+	ScmSummary string
+	// ScmDate is the date of the source code used to build this command.
+	ScmDate string
+	// BuildDate is the date this command was built.
+	BuildDate string
+
 	// The *Run functions are executed in the following order:
 	//   * PersistentPreRun()
 	//   * PreRun()
@@ -157,16 +185,13 @@ type Command struct {
 	// that we can use on every pflag set and children commands
 	globNormFunc func(f *flag.FlagSet, name string) flag.NormalizedName
 
-	// usageFunc is usage func defined by user.
-	usageFunc func(*Command) error
-	// flagErrorFunc is func defined by user and it's called when the parsing of
-	// flags returns an error.
-	flagErrorFunc func(*Command, error) error
-	// helpFunc is help func defined by user.
-	helpFunc func(*Command, []string)
 	// helpCommand is command with usage 'help'. If it's not defined by user,
 	// cobra uses default help command.
 	helpCommand *Command
+
+	// versionCommand is command with usage 'version'. If it's not defined by user,
+	// cobra uses default version command.
+	versionCommand *Command
 
 	// errPrefix is the error message prefix defined by user.
 	errPrefix string
@@ -177,9 +202,6 @@ type Command struct {
 	outWriter io.Writer
 	// errWriter is a writer defined by the user that replaces stderr
 	errWriter io.Writer
-
-	// FParseErrWhitelist flag parse errors to be ignored
-	FParseErrWhitelist FParseErrWhitelist
 
 	// commandsAreSorted defines, if command slice are sorted or not.
 	commandsAreSorted bool
@@ -274,22 +296,6 @@ func (c *Command) SetIn(newIn io.Reader) {
 	c.inReader = newIn
 }
 
-// SetUsageFunc sets usage function. Usage can be defined by application.
-func (c *Command) SetUsageFunc(f func(*Command) error) {
-	c.usageFunc = f
-}
-
-// SetFlagErrorFunc sets a function to generate an error when flag parsing
-// fails.
-func (c *Command) SetFlagErrorFunc(f func(*Command, error) error) {
-	c.flagErrorFunc = f
-}
-
-// SetHelpFunc sets help function. Can be defined by Application.
-func (c *Command) SetHelpFunc(f func(*Command, []string)) {
-	c.helpFunc = f
-}
-
 // SetHelpCommand sets help command.
 func (c *Command) SetHelpCommand(cmd *Command) {
 	c.helpCommand = cmd
@@ -365,16 +371,12 @@ func (c *Command) getIn(def io.Reader) io.Reader {
 // UsageFunc returns either the function set by SetUsageFunc for this command
 // or a parent, or it returns a default usage function.
 func (c *Command) UsageFunc() (f func(*Command) error) {
-	if c.usageFunc != nil {
-		return c.usageFunc
-	}
 	if c.HasParent() {
 		return c.Parent().UsageFunc()
 	}
 	return func(c *Command) error {
 		c.mergePersistentFlags()
-		fn := defaultUsageFunc
-		err := fn(c.OutOrStderr(), c)
+		err := defaultUsageFunc(c.OutOrStderr(), c)
 		if err != nil {
 			c.PrintErrln(err)
 		}
@@ -392,18 +394,9 @@ func (c *Command) Usage() error {
 // HelpFunc returns either the function set by SetHelpFunc for this command
 // or a parent, or it returns a function with default help behavior.
 func (c *Command) HelpFunc() func(*Command, []string) {
-	if c.helpFunc != nil {
-		return c.helpFunc
-	}
-	if c.HasParent() {
-		return c.Parent().HelpFunc()
-	}
 	return func(c *Command, a []string) {
 		c.mergePersistentFlags()
-		fn := defaultHelpFunc
-		// The help should be sent to stdout
-		// See https://github.com/spf13/cobra/issues/1002
-		err := fn(c.OutOrStdout(), c)
+		err := defaultHelpFunc(c.OutOrStdout(), c)
 		if err != nil {
 			c.PrintErrln(err)
 		}
@@ -441,13 +434,6 @@ func (c *Command) UsageString() string {
 // command or a parent, or it returns a function which returns the original
 // error.
 func (c *Command) FlagErrorFunc() (f func(*Command, error) error) {
-	if c.flagErrorFunc != nil {
-		return c.flagErrorFunc
-	}
-
-	if c.HasParent() {
-		return c.parent.FlagErrorFunc()
-	}
 	return func(c *Command, err error) error {
 		return err
 	}
@@ -705,11 +691,21 @@ func (c *Command) ArgsLenAtDash() int {
 	return c.Flags().ArgsLenAtDash()
 }
 
+// We define a type to hold the error from the *RunE functions, and to allow
+// us to run all of the *RunE and *Run hooks, then return the first error we
+// encountered, if any.
 type errRunner struct {
 	err error
 }
 
-func (erun *errRunner) Runner(fnE func(*Command, []string) error, fn func(*Command, []string), c *Command, args []string) {
+// Runner will run the *RunE function if it is defined, otherwise it will run
+// the *Run function if it is defined, but only if we haven't already
+// encountered an error.  If a *RunE function returns an error, that error is
+// saved and returned by the Error() function.
+func (erun *errRunner) Runner(
+	fnE func(*Command, []string) error,
+	fn func(*Command, []string),
+	c *Command, args []string) {
 	if erun.err == nil {
 		if fnE != nil {
 			erun.err = fnE(c, args)
@@ -719,6 +715,7 @@ func (erun *errRunner) Runner(fnE func(*Command, []string) error, fn func(*Comma
 	}
 }
 
+// Error returns the error from the *RunE function, if any.
 func (erun *errRunner) Error() error {
 	return erun.err
 }
@@ -754,9 +751,9 @@ func (c *Command) execute(a []string) (err error) {
 
 	// for back-compat, only add version flag behavior if version is defined
 	if c.Version != "" {
-		versionVal, err := c.Flags().GetBool("version")
+		versionVal, err := c.Flags().GetBool(versionFlagName)
 		if err != nil {
-			c.Println("\"version\" flag declared as non-bool. Please correct your code")
+			c.Printf("\"%s\" flag declared as non-bool. Please correct your code", versionFlagName)
 			return err
 		}
 		if versionVal {
@@ -784,35 +781,40 @@ func (c *Command) execute(a []string) (err error) {
 		return err
 	}
 
+	// Obtain the list of parents, starting with the current command and
+	// ending with the root parent.  When EnableTraverseRunHooks is set, we
+	// execute all persistent pre-runs from the root parent till this command,
+	// and all persistent post-runs from this command till the root parent.
+	// Otherwise, we execute only the persistent pre- and post-run hooks for
+	// the current command.
 	parents := make([]*Command, 0, 5)
 	for p := c; p != nil; p = p.Parent() {
 		if EnableTraverseRunHooks {
 			// When EnableTraverseRunHooks is set:
 			// - Execute all persistent pre-runs from the root parent till this command.
 			// - Execute all persistent post-runs from this command till the root parent.
-			parents = append([]*Command{p}, parents...)
+			parents = append(parents, p)
 		} else {
 			// Otherwise, execute only the first found persistent hook.
 			parents = append(parents, p)
+			break
 		}
 	}
 
 	eRun := &errRunner{}
-	p := parents[0]
-	eRun.Runner(p.PersistentPreRunE, p.PersistentPreRun, c, argWoFlags)
-	if EnableTraverseRunHooks {
-		for _, p := range parents[1:] {
-			eRun.Runner(p.PersistentPreRunE, p.PersistentPreRun, c, argWoFlags)
-		}
+	// We go ahead and run any parent PersistentPreRunE and PersistentPreRun
+	// hooks from the root parent till this command.
+	for _, p := range slices.Backward(parents) {
+		eRun.Runner(p.PersistentPreRunE, p.PersistentPreRun, c, argWoFlags)
 	}
 	eRun.Runner(c.PreRunE, c.PreRun, c, argWoFlags)
 	eRun.Runner(c.RunE, c.Run, c, argWoFlags)
 	eRun.Runner(c.PostRunE, c.PostRun, c, argWoFlags)
 	eRun.Runner(c.PersistentPostRunE, c.PersistentPostRun, c, argWoFlags)
-	if EnableTraverseRunHooks {
-		for p := c.parent; p != nil; p = p.Parent() {
-			eRun.Runner(p.PersistentPostRunE, p.PersistentPostRun, c, argWoFlags)
-		}
+	// We go ahead and run any parent PersistentPostRunE and PersistentPostRun
+	// hooks from this command till the root parent.
+	for _, p := range parents {
+		eRun.Runner(p.PersistentPostRunE, p.PersistentPostRun, c, argWoFlags)
 	}
 	return eRun.Error()
 }
@@ -869,8 +871,9 @@ func (c *Command) ExecuteC() (cmd *Command, err error) {
 		preExecHookFn(c)
 	}
 
-	// initialize help at the last point to allow for user overriding
+	// initialize help and version at the last point to allow for user overriding
 	c.InitDefaultHelpCmd()
+	c.InitDefaultVersionCmd()
 
 	args := c.args
 
@@ -966,17 +969,17 @@ func (c *Command) InitDefaultVersionFlag() {
 	}
 
 	c.mergePersistentFlags()
-	if c.Flags().Lookup("version") == nil {
-		usage := "version for "
+	if c.Flags().Lookup(versionFlagName) == nil {
+		usage := versionFlagName + " for "
 		if c.Name() == "" {
 			usage += "this command"
 		} else {
 			usage += c.DisplayName()
 		}
 		if c.Flags().ShorthandLookup("v") == nil {
-			c.Flags().BoolP("version", "v", false, usage)
+			c.Flags().BoolP(versionFlagName, "v", false, usage)
 		} else {
-			c.Flags().Bool("version", false, usage)
+			c.Flags().Bool(versionFlagName, false, usage)
 		}
 	}
 }
@@ -1015,6 +1018,78 @@ Simply type ` + c.DisplayName() + ` help [path to command] for full details.`,
 	}
 	c.RemoveCommand(c.helpCommand)
 	c.AddCommand(c.helpCommand)
+}
+
+func (c *Command) InitDefaultVersionCmd() {
+	if !c.HasSubCommands() {
+		return
+	}
+
+	if c.versionCommand == nil {
+		c.versionCommand = &Command{
+			Use:   versionCommandName,
+			Short: fmt.Sprintf("Print the version number for %s", c.DisplayName()),
+			Long:  fmt.Sprintf(`Display version and detailed build information for %s.`, c.DisplayName()),
+			Run: func(cmd *Command, args []string) {
+				if c.Version == "" {
+					c.Version = "(development)"
+				}
+				fmt.Println("    Version:", c.Version)
+				if c.ScmDate != "" {
+					fmt.Println("Commit Date:", c.ScmDate)
+				}
+				if c.ScmCommit != "" {
+					fmt.Println("     Commit:", c.ScmCommit)
+				}
+				fmt.Println("      State:", c.ScmState)
+				if c.ScmSummary != "" {
+					fmt.Println("    Summary:", c.ScmSummary)
+				}
+				if c.BuildDate != "" {
+					fmt.Println(" Build Date:", c.BuildDate)
+				}
+			},
+		}
+		// Extract version information from the stored build information.
+		bi, ok := dbug.ReadBuildInfo()
+		if ok {
+			c.Version = bi.Main.Version
+			c.ScmDate = getBuildSettings(bi.Settings, "vcs.time")
+			c.ScmCommit = getBuildSettings(bi.Settings, "vcs.revision")
+			if len(c.ScmCommit) > 1 {
+				c.ScmSummary = fmt.Sprintf("%s-1-%s", c.Version, c.ScmCommit[0:7])
+			}
+			c.ScmState = "clean"
+			if getBuildSettings(bi.Settings, "vcs.modified") == "true" {
+				c.ScmState = "dirty"
+			}
+			OsCpuType = fmt.Sprintf("%s-%s", getBuildSettings(bi.Settings, "GOOS"), getBuildSettings(bi.Settings, "GOARCH"))
+		}
+		// Get the build date (as the modified date of the executable) if the build date
+		// is not set.
+		if c.BuildDate == "" {
+			fpath, err := os.Executable()
+			CheckErr(err)
+			fpath, err = filepath.EvalSymlinks(fpath)
+			CheckErr(err)
+			fsys := os.DirFS(filepath.Dir(fpath))
+			fInfo, err := fs.Stat(fsys, filepath.Base(fpath))
+			CheckErr(err)
+			c.BuildDate = fInfo.ModTime().UTC().Format(time.RFC3339)
+		}
+	}
+	c.RemoveCommand(c.versionCommand)
+	c.AddCommand(c.versionCommand)
+}
+
+// getBuildSettings extracts the value for a given key from the build settings.
+func getBuildSettings(settings []dbug.BuildSetting, key string) string {
+	for _, v := range settings {
+		if v.Key == key {
+			return v.Value
+		}
+	}
+	return ""
 }
 
 // ResetCommands delete parent, subcommand and help command from c.
@@ -1475,8 +1550,8 @@ func (c *Command) ParseFlags(args []string) error {
 	beforeErrorBufLen := c.flagErrorBuf.Len()
 	c.mergePersistentFlags()
 
-	// do it here after merging all flags and just before parse
-	c.Flags().ParseErrorsAllowlist = flag.ParseErrorsAllowlist(c.FParseErrWhitelist)
+	// // do it here after merging all flags and just before parse
+	// c.Flags().ParseErrorsAllowlist = flag.ParseErrorsAllowlist(c.FParseErrWhitelist)
 
 	err := c.Flags().Parse(args)
 	// Print warnings if they occurred (e.g. deprecated flag messages).
@@ -1534,40 +1609,43 @@ func commandNameMatches(s string, t string) bool {
 
 // defaultUsageFunc is equivalent to executing defaultUsageTemplate. The two should be changed in sync.
 func defaultUsageFunc(w io.Writer, in interface{}) error {
+	tWidth, _ := getTermWidthHeight()
 	c := in.(*Command)
 	fmt.Fprint(w, "Usage:")
 	if c.Runnable() {
-		fmt.Fprintf(w, "\n  %s", c.UseLine())
+		fmt.Fprintf(w, "\n  %s", wrap(2, tWidth, c.UseLine()))
 	}
 	if c.HasAvailableSubCommands() {
 		fmt.Fprintf(w, "\n  %s [command]", c.CommandPath())
 	}
 	if c.HasExample() {
 		fmt.Fprintf(w, "\n\nExamples:\n")
-		fmt.Fprintf(w, "%s", c.Example)
+		fmt.Fprintf(w, "%s", wrap(4, tWidth, c.Example))
 	}
 	if c.HasAvailableSubCommands() {
 		cmds := c.Commands()
 		fmt.Fprintf(w, "\n\nAvailable Commands:")
 		for _, subcmd := range cmds {
 			if subcmd.IsAvailableCommand() || subcmd.Name() == helpCommandName {
-				fmt.Fprintf(w, "\n  %s %s", rpad(subcmd.Name(), subcmd.NamePadding()), subcmd.Short)
+				fmt.Fprintf(w, "\n  %s", wrapSubCommand(2, tWidth,
+					rpad(subcmd.Name(), subcmd.NamePadding()), subcmd.Short))
 			}
 		}
 	}
 	if c.HasAvailableLocalFlags() {
 		fmt.Fprintf(w, "\n\nFlags:\n")
-		fmt.Fprint(w, trimRightSpace(c.LocalFlags().FlagUsages()))
+		fmt.Fprint(w, trimRightSpace(c.LocalFlags().FlagUsagesWrapped(tWidth)))
 	}
 	if c.HasAvailableInheritedFlags() {
 		fmt.Fprintf(w, "\n\nGlobal Flags:\n")
-		fmt.Fprint(w, trimRightSpace(c.InheritedFlags().FlagUsages()))
+		fmt.Fprint(w, trimRightSpace(c.InheritedFlags().FlagUsagesWrapped(tWidth)))
 	}
 	if c.HasHelpSubCommands() {
 		fmt.Fprintf(w, "\n\nAdditional help topics:")
 		for _, subcmd := range c.Commands() {
 			if subcmd.IsAdditionalHelpTopicCommand() {
-				fmt.Fprintf(w, "\n  %s %s", rpad(subcmd.CommandPath(), subcmd.CommandPathPadding()), subcmd.Short)
+				fmt.Fprintf(w, "\n  %s", wrapSubCommand(2, tWidth,
+					rpad(subcmd.CommandPath(), subcmd.CommandPathPadding()), subcmd.Short))
 			}
 		}
 	}
@@ -1579,7 +1657,8 @@ func defaultUsageFunc(w io.Writer, in interface{}) error {
 }
 
 // defaultHelpFunc is equivalent to executing defaultHelpTemplate. The two should be changed in sync.
-func defaultHelpFunc(w io.Writer, in interface{}) error {
+func defaultHelpFunc(w io.Writer, in any) error {
+	tWidth, _ := getTermWidthHeight()
 	c := in.(*Command)
 	usage := c.Long
 	if usage == "" {
@@ -1587,7 +1666,7 @@ func defaultHelpFunc(w io.Writer, in interface{}) error {
 	}
 	usage = trimRightSpace(usage)
 	if usage != "" {
-		fmt.Fprintln(w, usage)
+		fmt.Fprintln(w, wrap(0, tWidth, usage))
 		fmt.Fprintln(w)
 	}
 	if c.Runnable() || c.HasSubCommands() {
@@ -1623,7 +1702,7 @@ func legacyArgs(cmd *Command, args []string) error {
 }
 
 // CheckErr prints the msg with the prefix 'Error:' and exits with error code 1. If the msg is nil, it does nothing.
-func CheckErr(msg interface{}) {
+func CheckErr(msg any) {
 	if msg != nil {
 		fmt.Fprintln(os.Stderr, "Error:", msg)
 		os.Exit(1)
@@ -1650,4 +1729,78 @@ func rpad(s string, padding int) string {
 
 func trimRightSpace(s string) string {
 	return strings.TrimRightFunc(s, unicode.IsSpace)
+}
+
+func getTermWidthHeight() (width int, height int) {
+	width, height, err := term.GetSize(int(os.Stdout.Fd()))
+	if err != nil {
+		// Default to 80x24 if we can't get the terminal size
+		return 80, 24
+	}
+	return width, height
+}
+
+func wrapSubCommand(i, w int, subCmsStr string, shortDesc string) string {
+	indent := i + len(subCmsStr) + 1
+	return wrap(indent, w, fmt.Sprintf("%s %s", subCmsStr, shortDesc))
+}
+
+// Wraps the string `s` to a maximum width `w` with leading indent
+// `i`. The first line is not indented (this is assumed to be done by
+// caller). Pass `w` == 0 to do no wrapping
+func wrap(i, w int, s string) string {
+	if w == 0 {
+		return strings.Replace(s, "\n", "\n"+strings.Repeat(" ", i), -1)
+	}
+	// space between indent i and end of line width w into which
+	// we should wrap the text.
+	wrap := w - i
+	var r, l string
+	// Not enough space for sensible wrapping. Wrap as a block on
+	// the next line instead.
+	if wrap < 24 {
+		i = 16
+		wrap = w - i
+		r += "\n" + strings.Repeat(" ", i)
+	}
+	// If still not enough space then don't even try to wrap.
+	if wrap < 24 {
+		return strings.Replace(s, "\n", r, -1)
+	}
+	// Try to avoid short orphan words on the final line, by
+	// allowing wrapN to go a bit over if that would fit in the
+	// remainder of the line.
+	slop := 5
+	wrap = wrap - slop
+	// Handle first line, which is indented by the caller (or the
+	// special case above)
+	l, s = wrapN(wrap, slop, s)
+	r = r + strings.Replace(l, "\n", "\n"+strings.Repeat(" ", i), -1)
+	// Now wrap the rest
+	for s != "" {
+		var t string
+		t, s = wrapN(wrap, slop, s)
+		r = r + "\n" + strings.Repeat(" ", i) + strings.Replace(t, "\n", "\n"+strings.Repeat(" ", i), -1)
+	}
+	return r
+}
+
+// Splits the string `s` on whitespace into an initial substring up to
+// `i` runes in length and the remainder. Will go `slop` over `i` if
+// that encompasses the entire string (which allows the caller to
+// avoid short orphan words on the final line).
+func wrapN(i, slop int, s string) (string, string) {
+	if i+slop > len(s) {
+		return s, ""
+	}
+
+	w := strings.LastIndexAny(s[:i], " \t\n")
+	if w <= 0 {
+		return s, ""
+	}
+	nlPos := strings.LastIndex(s[:i], "\n")
+	if nlPos > 0 && nlPos < w {
+		return s[:nlPos], s[nlPos+1:]
+	}
+	return s[:w], s[w+1:]
 }
