@@ -872,8 +872,8 @@ func (c *Command) ExecuteC() (cmd *Command, err error) {
 	}
 
 	// initialize help and version at the last point to allow for user overriding
-	c.InitDefaultHelpCmd()
 	c.InitDefaultVersionCmd()
+	c.InitDefaultHelpCmd()
 
 	args := c.args
 
@@ -955,7 +955,7 @@ func (c *Command) InitDefaultHelpFlag() {
 		} else {
 			usage += name
 		}
-		c.Flags().BoolP(helpFlagName, "h", false, usage)
+		c.PersistentFlags().BoolP(helpFlagName, "h", false, usage)
 	}
 }
 
@@ -977,9 +977,9 @@ func (c *Command) InitDefaultVersionFlag() {
 			usage += c.DisplayName()
 		}
 		if c.Flags().ShorthandLookup("v") == nil {
-			c.Flags().BoolP(versionFlagName, "v", false, usage)
+			c.PersistentFlags().BoolP(versionFlagName, "v", false, usage)
 		} else {
-			c.Flags().Bool(versionFlagName, false, usage)
+			c.PersistentFlags().Bool(versionFlagName, false, usage)
 		}
 	}
 }
@@ -1026,6 +1026,34 @@ func (c *Command) InitDefaultVersionCmd() {
 	}
 
 	if c.versionCommand == nil {
+		// Extract version information from the stored build information.
+		bi, ok := dbug.ReadBuildInfo()
+		if ok {
+			c.Version = bi.Main.Version
+			c.ScmDate = getBuildSettings(bi.Settings, "vcs.time")
+			c.ScmCommit = getBuildSettings(bi.Settings, "vcs.revision")
+			if len(c.ScmCommit) > 1 {
+				c.ScmSummary = fmt.Sprintf("%s-1-%s", c.Version, c.ScmCommit[0:7])
+			}
+			c.ScmState = "clean"
+			if getBuildSettings(bi.Settings, "vcs.modified") == "true" {
+				c.ScmState = "dirty"
+			}
+			OsCpuType = fmt.Sprintf("%s-%s", getBuildSettings(bi.Settings, "GOOS"), getBuildSettings(bi.Settings, "GOARCH"))
+		}
+		c.InitDefaultVersionFlag() // make possible 'version' flag to be shown
+		// Get the build date (as the modified date of the executable) if the build date
+		// is not set.
+		if c.BuildDate == "" {
+			fpath, err := os.Executable()
+			CheckErr(err)
+			fpath, err = filepath.EvalSymlinks(fpath)
+			CheckErr(err)
+			fsys := os.DirFS(filepath.Dir(fpath))
+			fInfo, err := fs.Stat(fsys, filepath.Base(fpath))
+			CheckErr(err)
+			c.BuildDate = fInfo.ModTime().UTC().Format(time.RFC3339)
+		}
 		c.versionCommand = &Command{
 			Use:   versionCommandName,
 			Short: fmt.Sprintf("Print the version number for %s", c.DisplayName()),
@@ -1050,33 +1078,7 @@ func (c *Command) InitDefaultVersionCmd() {
 				}
 			},
 		}
-		// Extract version information from the stored build information.
-		bi, ok := dbug.ReadBuildInfo()
-		if ok {
-			c.Version = bi.Main.Version
-			c.ScmDate = getBuildSettings(bi.Settings, "vcs.time")
-			c.ScmCommit = getBuildSettings(bi.Settings, "vcs.revision")
-			if len(c.ScmCommit) > 1 {
-				c.ScmSummary = fmt.Sprintf("%s-1-%s", c.Version, c.ScmCommit[0:7])
-			}
-			c.ScmState = "clean"
-			if getBuildSettings(bi.Settings, "vcs.modified") == "true" {
-				c.ScmState = "dirty"
-			}
-			OsCpuType = fmt.Sprintf("%s-%s", getBuildSettings(bi.Settings, "GOOS"), getBuildSettings(bi.Settings, "GOARCH"))
-		}
-		// Get the build date (as the modified date of the executable) if the build date
-		// is not set.
-		if c.BuildDate == "" {
-			fpath, err := os.Executable()
-			CheckErr(err)
-			fpath, err = filepath.EvalSymlinks(fpath)
-			CheckErr(err)
-			fsys := os.DirFS(filepath.Dir(fpath))
-			fInfo, err := fs.Stat(fsys, filepath.Base(fpath))
-			CheckErr(err)
-			c.BuildDate = fInfo.ModTime().UTC().Format(time.RFC3339)
-		}
+		// c.InitDefaultVersionFlag()
 	}
 	c.RemoveCommand(c.versionCommand)
 	c.AddCommand(c.versionCommand)
